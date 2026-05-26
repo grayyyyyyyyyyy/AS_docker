@@ -1,0 +1,96 @@
+name: docker
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t kubsu-app ./docker
+      - name: Save image to tar
+        run: docker save kubsu-app -o /tmp/kubsu-app.tar
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/kubsu-app.tar
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: kubsu
+          POSTGRES_PASSWORD: kubsu
+          POSTGRES_USER: kubsu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+      - name: Load Docker image
+        run: docker load -i /tmp/kubsu-app.tar
+      - name: Run tests in container
+        run: |
+          docker run --rm \
+            --network host \
+            -e DB_HOST=localhost \
+            -e DB_PORT=5432 \
+            -e DB_NAME=kubsu \
+            -e DB_USER=kubsu \
+            -e DB_PASS=kubsu \
+            kubsu-app \
+            pytest tests
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [ test ]
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 212.192.134.135
+          port: 58529
+          username: turing
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker stop kubsu-app || true
+            docker rm kubsu-app || true
+            docker pull ${{ secrets.DOCKER_REGISTRY }}/kubsu-app:latest || true
+            docker run -d \
+              --name kubsu-app \
+              --network host \
+              -e DB_HOST=127.0.0.1 \
+              -e DB_PORT=5432 \
+              -e DB_NAME=kubsu \
+              -e DB_USER=kubsu \
+              -e DB_PASS=kubsu \
+              -p 8114:8114 \
+              kubsu-app
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: [ deploy ]
+    steps:
+      - name: Verify deployment
+        run: |
+          sleep 5
+          curl -f http://212.192.134.135:60080/turing/users/ || exit 1
